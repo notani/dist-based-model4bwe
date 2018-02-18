@@ -3,5 +3,10 @@ PyTorch implementation of "A Distribution-based Model to Learn Bilingual Word Em
 
 
 ```shell
+conda install pytorch -c pytorch -y
+conda install tqdm
+```
+
+```shell
 python main.py data/ukWaC/tokenized.mini.txt.xz -o vectors.txt -v
 ```
