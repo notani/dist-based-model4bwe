@@ -188,7 +188,7 @@ def main(args):
     loss_func = NegativeSamplingLoss(corpus.freq)
     optimizer = optim.SGD(model.parameters(), lr=lr)
 
-    for ITER in range(1):
+    for ITER in range(args.n_iters):
         np.random.shuffle(train)
         train_words, train_loss = 0, 0.0
         start = time.time()
@@ -219,6 +219,8 @@ if __name__ == '__main__':
                         help='learning rate')
     parser.add_argument('--batch-size', type=int, default=1024,
                         help='batch size')
+    parser.add_argument('--iter', dest='n_iters', type=int, default=5,
+                        help='number of iterations')
     parser.add_argument('--seed', dest='random_seed', type=int, default=42,
                         help='random seed')
     parser.add_argument('-o', '--output', dest='path_output',
