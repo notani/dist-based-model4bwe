@@ -24,21 +24,31 @@ use_cuda = False
 
 class CBOW(nn.Module):
     """Continuous bag-of-words model."""
-    def __init__(self, vocab_size, dim_embed=50, *args, **kwargs):
-        "Initialize a network."
+    def __init__(self, vocab_size, dim_emb=50, *args, **kwargs):
+        """Initialize a network."""
         super(CBOW, self).__init__()
         self.verbose = kwargs.get('verbose', False)
         self.logger = init_logger('CBOW')
-        self.embeddings = nn.Embedding(vocab_size, dim_embed, sparse=True)
-        self.l1 = nn.Linear(dim_embed, vocab_size)
+        self.embeddings_x = nn.Embedding(vocab_size, dim_emb, sparse=True)
+        self.embeddings_y = nn.Embedding(vocab_size, dim_emb, sparse=True)
 
-    def forward(self, X):
-        context = self.embeddings(X).mean(dim=1)
-        return self.l1(context)
+    def forward(self, X, y):
+        """Forward calculation."""
+        context = self.embeddings_x(X).mean(dim=1)
+        target = self.embeddings_y(y)
+        return torch.mul(target, context).sum(dim=1)
+
+    def forward_neg(self, X, y):
+        """Forward calculation for nagative samples."""
+        context = self.embeddings_x(X).mean(dim=1)  # (batch_size, dim_embed)
+        context = context.unsqueeze(dim=2)  # (batch_size, dim_embed, 1)
+        target = self.embeddings_y(y)  # (batch_size, neg_sample_size, dim_emb)
+        # Output: (batch_size, neg_sample_size)
+        return torch.bmm(target, context).squeeze(dim=2)
 
     def get_embeddings(self):
         """Return embeddings."""
-        dat = self.embeddings.weight.data
+        dat = self.embeddings_y.weight.data
         if use_cuda:
             dat = dat.cpu()
         return dat.numpy()
@@ -52,15 +62,19 @@ class Corpus():
         self.logger = init_logger('Corpus')
         self.window_size = window_size  # length of window on each side
         self.w2i = defaultdict(lambda: len(self.w2i))
+        self.freq = defaultdict(int)
         self.UNK = self.w2i['<unk>']
         self.BOS = self.w2i['<s>']
         self.EOS = self.w2i['</s>']
+        self.freq[self.UNK] = 0
+        self.freq[self.BOS] = 0
+        self.freq[self.EOS] = 0
 
     def set_i2w(self):
         """Initialize an i2w indexer."""
         self.i2w = [w for w, _ in sorted(self.w2i.items(), key=lambda t: t[1])]
 
-    def read(self, path_corpus):
+    def read(self, path_corpus, count=True):
         """Read a corpus and convert it into a matrix of word indices."""
         if path_corpus.endswith('.xz'):
             f = lzma.open(path_corpus, 'rt')
@@ -76,6 +90,9 @@ class Corpus():
                 continue
             indices = [self.BOS] + [self.w2i[w] for w in words] \
                       + [self.EOS]
+            if count:
+                for idx in indices[1:-1]:
+                    self.freq[idx] += 1
             yield indices
         if self.verbose:
             self.logger.info('Done.')
@@ -108,6 +125,36 @@ def generate_batch(sents, window, batch_size):
                 contexts, targets, count = [], [], 0
 
 
+class NegativeSamplingLoss():
+    def __init__(self, freq, sample_size=5):
+        """Initialize a sampler."""
+        self.calc_prior(freq)
+        self.sample_size = sample_size
+
+    def calc_prior(self, freq):
+        """Compute sampling prior."""
+        self.p = torch.FloatTensor(
+            [v for i, v in sorted(freq.items(), key=lambda t: t[1])])
+        self.p **= 0.75
+        self.p /= self.p.sum()
+        self.N = self.p.shape[0]
+
+    def __call__(self, model, contexts, targets):
+        """Compute the loss value."""
+        B = contexts.size(0)  # batch size
+        # Positive samples
+        loss = model.forward(contexts, targets).sigmoid().log().sum()
+
+        # Negative samples
+        n_neg = B * self.sample_size
+        targets_neg = Variable(torch.multinomial(self.p, n_neg))
+        targets_neg = targets_neg.view((B, -1))
+        if use_cuda:
+            targets_neg = targets_neg.cuda()
+        loss += model.forward_neg(contexts, targets_neg).neg().sigmoid().log().sum()
+        return loss / B
+
+
 def save_embeddings(filename, embs, i2w):
     if verbose:
         logger.info('Save embeddings to ' + filename)
@@ -138,7 +185,7 @@ def main(args):
     model = CBOW(corpus.get_vocabsize(), verbose=verbose)
     if use_cuda:
         model.cuda()
-    loss_func = nn.CrossEntropyLoss()
+    loss_func = NegativeSamplingLoss(corpus.freq)
     optimizer = optim.SGD(model.parameters(), lr=lr)
 
     for ITER in range(1):
@@ -147,12 +194,11 @@ def main(args):
         start = time.time()
         for contexts, targets in tqdm(generate_batch(train, window_size, batch_size)):
             model.zero_grad()
-            loss = loss_func(model(contexts), targets)
+            loss = loss_func(model, contexts, targets)
             loss.backward()
             optimizer.step()
             train_words += batch_size
             train_loss += float(loss.data)
-            break
         print('[{}] loss/word = {:.4f}, ppl={:.4f}, time = {:.2f}'.format(
             ITER+1, train_loss / train_words, np.exp(train_loss / train_words),
             time.time() - start))
