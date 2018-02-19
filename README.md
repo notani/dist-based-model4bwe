@@ -8,5 +8,5 @@ conda install tqdm
 ```
 
 ```shell
-python main.py data/ukWaC/tokenized.mini.txt.xz -o vectors.txt -v
+python main.py --src en:data/ukWaC/tokenized.mini.txt.xz --trg it:data/itWaC/tokenized.mini.txt.xz -o vectors.txt --batch-size 1 --lr 0.001 -v
 ```
