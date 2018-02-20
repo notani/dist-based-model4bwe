@@ -177,7 +177,7 @@ class NegativeSamplingLoss():
 
         # TODO: trick on cross-lingual negative sampling
 
-        return loss
+        return -loss
 
 
 class DistributionLoss():
