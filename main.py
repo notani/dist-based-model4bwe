@@ -177,63 +177,60 @@ class NegativeSamplingLoss():
 
         # TODO: trick on cross-lingual negative sampling
 
-        return loss / B
+        return loss
 
 
 class DistributionLoss():
     def __init__(self, dim_emb, lambda_m=0.2, lambda_v=0.1):
-        self.m = {l: torch.zeros(dim_emb) for l in ['src', 'trg']}
-        self.v = {l: torch.zeros((dim_emb, dim_emb)) for l in ['src', 'trg']}
+        self.dim_emb = dim_emb
+        self.m = {l: Variable(torch.zeros(dim_emb), requires_grad=False)
+                  for l in ['src', 'trg']}
+        self.v = {l: Variable(torch.zeros(dim_emb), requires_grad=False)
+                  for l in ['src', 'trg']}
+        if use_cuda:
+            for l in ['src', 'trg']:
+                self.m[l] = self.m[l].cuda()
+                self.v[l] = self.v[l].cuda()
         self.scount = {l: 0 for l in ['src', 'trg']}
-        self.updated = {l: False for l in ['src', 'trg']}
         self.lambda_m = lambda_m
         self.lambda_v = lambda_v
 
     def __call__(self, model, x, src=True):
         """Calculate a distribution loss."""
-        if src:
-            self.update_stats(model, x, 'src')
-        else:
-            self.update_stats(model, x, 'trg')
-
-        if not (self.updated['src'] and self.updated['trg']):
-            # Not updated yet
-            return None
-
-        loss = self.lambda_m * (self.m['src'] - self.m['trg']).pow(2).sum() / 2
-        loss += self.lambda_v * (self.v['src'] - self.v['trg']).pow(2).sum() / 2
-        return loss
-
-    def update_stats(self, model, x, lang):
-        """Update a mean vector and a covariance matrix.
-
-        In the paper, the update formula is defined w.r.t. one instance.
-        But contexts contain multiple words, and it will be more reasonable to
-        update the statistics w.r.t. the whole context."""
-        x = x.squeeze(dim=0)  # -> (window_size * 2, dim_embed)
+        x = x.view((-1, 1))  # -> (window_size * 2, dim_embed)
         N = x.size(0)
 
-        # Aggregate vectors (different from the paper)
-        vec = model.embeddings_x(x).sum(dim=0).squeeze().data  # -> (dim_embed)
+        lang = 'src' if src else 'trg'
+        lang_i = 'trg' if src else 'src'
+
+        # IDs -> (batch_size * window_size, dim_embed)
+        vec = model.embeddings_x(x).squeeze(dim=1)
 
         # Mean
-        new_m = vec
-        if self.m[lang] is not None:
-            new_m += self.scount[lang] * self.m[lang]
-        self.m[lang] = new_m / (self.scount[lang] + N)  # in the paper, N = 1
+        m = (self.m[lang] * self.scount[lang] + vec) / (self.scount[lang] + 1)
 
         # Covariance
-        diff = (self.m[lang] - vec).view((-1, 1))
-        new_v = diff.mul(diff.t())
-        if self.v[lang] is not None:
-            new_v += self.scount[lang] * self.v[lang]
-        self.v[lang] = new_v / (self.scount[lang] + N)
+        v = (self.v[lang] * self.scount[lang] + (m - vec).pow(2)) \
+            / (self.scount[lang] + 1)
 
+        # Difference
+        diff_m = m - self.m[lang_i]
+        diff_v = v - self.v[lang_i]
+
+        # L2 Loss (averaged by # of instances)
+        loss = self.lambda_m * diff_m.pow(2).sum() / 2
+        loss += self.lambda_v * diff_v.pow(2).sum() / 2
+
+        # Update statistics
+        self.m[lang].data = m.data.mean(dim=0)
+        self.v[lang].data = v.data.mean(dim=0)
         self.scount[lang] = min(100000, self.scount[lang] + N)
-        self.updated[lang] = True
+
+        return loss
 
 
 def save_embeddings(filename, embs, i2w):
+    """Save word embeddings to a file."""
     if verbose:
         logger.info('Save embeddings to ' + filename)
     with open(filename, 'w') as f:
@@ -253,9 +250,9 @@ def main(args):
         torch.cuda.manual_seed(args.random_seed)
     np.random.seed(args.random_seed)
 
+    window_size = args.window_size
     lr = args.lr
     batch_size = args.batch_size
-    window_size = args.window_size
 
     # Load data
     lang_src, path_src = args.path_src.split(':')
@@ -273,32 +270,46 @@ def main(args):
     loss_func_dist = DistributionLoss(DIM_EMB)
     optimizer = optim.SGD(model.parameters(), lr=lr)
 
+    if verbose:
+        logger.info('window size: {}'.format(window_size))
+        logger.info('learning rate: {}'.format(lr))
+        logger.info('batch size: {}'.format(batch_size))
+
     for ITER in range(args.n_iters):
-        train_loss = 0.0
+        train_loss_we, train_loss_d = 0.0, 0.0
         start = time.time()
+
+        # Shuffle sentences and create batches
         np.random.shuffle(sents_src)
         batches_src = generate_batch(sents_src, window_size, batch_size)
         np.random.shuffle(sents_trg)
         batches_trg = generate_batch(sents_trg, window_size, batch_size)
+
         for batch_src, batch_trg in tqdm(zip_longest(batches_src, batches_trg)):
             for batch, src in [(batch_src, True), (batch_trg, False)]:
                 if batch is None:  # no instances in the batch
                     continue
                 model.zero_grad()
                 contexts, targets = batch
-                loss = loss_func(model, contexts, targets, src=src)
+                loss_we = loss_func(model, contexts, targets, src=src)
                 loss_d = loss_func_dist(model, contexts, src=src)
-                if loss_d is not None:  # distribution loss
-                    loss += loss_d
+                if loss_d is None:  # distribution loss
+                    loss = loss_we
+                else:
+                    loss = loss_we + loss_d
+                    train_loss_d += float(loss_d.data / batch_size)
+                loss /= batch_size
                 loss.backward()
                 optimizer.step()
-                train_loss += float(loss.data)
-        print('[{}] loss = {:.4f}, time = {:.2f}'.format(
-            ITER+1, train_loss, time.time() - start))
+                train_loss_we += float(loss_we.data / batch_size)
+        print('[{}] loss = {:.4f} ({:.4f}/{:.4f}), time = {:.2f}'.format(
+            ITER+1, train_loss_we + train_loss_d , train_loss_we, train_loss_d,
+            time.time() - start))
 
-    # Save vectors
-    embs = model.get_embeddings()
-    save_embeddings(args.path_output, embs, corpus.i2w)
+        # Save vectors
+        embs = model.get_embeddings()
+        save_embeddings(args.path_output, embs, corpus.i2w)
+
     return 0
 
 
