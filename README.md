@@ -44,4 +44,8 @@ model.most_similar('en:cat')
 > [('en:folk-tales', 0.5345577597618103), ('en:inject', 0.5104585886001587), ('it:mariotti', 0.4928727149963379), ('it:ebbero', 0.48998019099235535), ('it:funzionano', 0.4896196126937866), ('it:trash', 0.47888505458831787), ('en:feudal', 0.47887367010116577), ('en:creeps', 0.47296014428138733), ('it:abbronzati', 0.4703264832496643), ('en:staging', 0.4651801586151123)]
 ```
 
-Umm...
+# Cross-ligual learning
+
+```shell
+python main.py --src en:data/ukWaC/tokenized.1m.txt.xz --trg it:data/itWaC/tokenized.1m.txt.xz -o vectors.en.it.1m.d128.mf10.txt --batch-size 64 --lr 0.5 --model models/en.it/full.1m --iter 100 --min-freq 10 --dim 128 -v
+```

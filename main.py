@@ -61,10 +61,12 @@ class CBOW(nn.Module):
 
 class Corpus():
     """Corpus reader."""
-    def __init__(self, window_size, *args, **kwargs):
+    def __init__(self, window_size, min_freq=0, **kwargs):
         "Set variables."
         self.verbose = kwargs.get('verbose', False)
         self.logger = init_logger('Corpus')
+        self.min_freq = min_freq
+        assert self.min_freq >= 0, 'min_freq must be >= 0'
         self.window_size = window_size  # length of window on each side
 
         # Vocabulary
@@ -86,6 +88,14 @@ class Corpus():
 
     def read(self, path_corpus, lang, count=True):
         """Read a corpus and convert it into a matrix of word indices."""
+        vocab = None
+        if self.min_freq > 0:
+            freq = self.count_words(path_corpus)
+            vocab = set([w for w, freq in freq.items()
+                         if freq >= self.min_freq])
+            if self.verbose:
+                self.logger.info('Use {} unique words'.format(len(vocab)))
+
         if path_corpus.endswith('.xz'):
             f = lzma.open(path_corpus, 'rt')
         elif path_corpus.endswith('.gz'):
@@ -95,12 +105,13 @@ class Corpus():
         if self.verbose:
             self.logger.info('Read from ' + path_corpus)
         vocab_start = len(self.w2i)
-        for line in f:
+        for line in tqdm(f):
             words = line.strip().split()
             if len(words) < 2 * self.window_size - 1:
                 continue
             # e.g., en:apple
-            indices = [self.w2i[lang + ':' + w] for w in words]
+            indices = [self.w2i[lang + ':' + w] if w in vocab else self.UNK
+                       for w in words]
             if count:
                 for idx in indices:
                     self.freq[idx] += 1
@@ -112,6 +123,31 @@ class Corpus():
         # Record vocabulary range
         vocab_end = len(self.w2i)
         self.vocab_range[lang] = (vocab_start, vocab_end)
+
+    def count_words(self, path_corpus):
+        """Count words in a given corpus."""
+        if path_corpus.endswith('.xz'):
+            f = lzma.open(path_corpus, 'rt')
+        elif path_corpus.endswith('.gz'):
+            f = gzip.open(path_corpus, 'rt')
+        else:
+            f = open(path_corpus, 'rt')
+        if self.verbose:
+            self.logger.info('Count words in ' + path_corpus)
+        freq = defaultdict(int)
+
+        for line in tqdm(f):
+            words = line.strip().split()
+            if len(words) < 2 * self.window_size - 1:
+                continue
+            for w in words:
+                freq[w] += 1
+        if self.verbose:
+            self.logger.info('Done. {} unique words.'.format(len(freq)))
+        f.close()
+
+        return freq
+        
 
     def get_vocabsize(self):
         return len(self.w2i)
@@ -282,7 +318,8 @@ def main(args):
     batch_size = args.batch_size
 
     # Load data
-    corpus = Corpus(window_size=window_size, verbose=verbose)
+    corpus = Corpus(window_size=window_size, verbose=verbose,
+                    min_freq=args.min_freq)
     lang_src, path_src = args.path_src.split(':')
     sents_src = list(corpus.read(path_src, lang=lang_src))
     if verbose:
@@ -345,6 +382,7 @@ def main(args):
                     val = loss_d.data.cpu() if use_cuda else loss_d.data
                     train_loss_d += float(val.numpy())
 
+                loss /= batch_size
                 loss.backward()
                 optimizer.step()
         print('[{}] loss = {:.4f} ({:.4f}/{:.4f}), time = {:.2f}'.format(
@@ -375,6 +413,8 @@ if __name__ == '__main__':
                         help='learning rate')
     parser.add_argument('--batch-size', type=int, default=1024,
                         help='batch size')
+    parser.add_argument('--min-freq', type=int, default=10,
+                        help='minimum frequency')
     parser.add_argument('--iter', dest='n_iters', type=int, default=5,
                         help='number of iterations')
     parser.add_argument('--seed', dest='random_seed', type=int, default=42,
