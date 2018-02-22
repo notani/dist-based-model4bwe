@@ -44,7 +44,7 @@ class CBOW(nn.Module):
 
     def forward_neg(self, X, y):
         """Forward calculation for nagative samples."""
-        context = self.embeddings_x(X).mean(dim=1)  # (batch_size, dim_embed)
+        context = self.embeddings_x(X).mean(dim=1).squeeze(1)  # (batch_size, dim_embed)
         context = context.unsqueeze(dim=2)  # (batch_size, dim_embed, 1)
         target = self.embeddings_y(y)  # (batch_size, neg_sample_size, dim_emb)
         # Output: (batch_size, neg_sample_size)
@@ -139,20 +139,23 @@ def generate_batch(sents, window, batch_size):
 
 
 class NegativeSamplingLoss():
-    def __init__(self, freq, ranges, src='en', trg='it', sample_size=5):
+    def __init__(self, freq, ranges, src='en', trg=None, sample_size=5):
         """Initialize a sampler."""
         self.calc_prior(freq, ranges, src, trg)
         self.sample_size = sample_size
 
-    def calc_prior(self, freq, ranges, src='en', trg='it'):
+    def calc_prior(self, freq, ranges, src='en', trg=None):
         """Compute sampling prior."""
         self.p = torch.FloatTensor(
             [v for i, v in sorted(freq.items(), key=lambda t: t[1])])
         self.p **= 0.75
         # Language specific prior
         self.p_src = self.p[:ranges[src][1]].clone()
-        self.p_trg = self.p[ranges[trg][0]:].clone()
         self.p_src /= self.p_src.sum()
+        if trg is None:
+            self.p_trg = None
+            return
+        self.p_trg = self.p[ranges[trg][0]:].clone()
         self.p_trg /= self.p_trg.sum()
         self.offset_trg = ranges[trg][0]
 
@@ -169,13 +172,17 @@ class NegativeSamplingLoss():
 
         # Negative samples
         n_neg = B * self.sample_size
-        targets_neg = [
-            torch.multinomial(p_mono, n_neg, replacement=True).view((B, -1)),
-            torch.multinomial(p_cross, n_neg, replacement=True).view((B, -1))]
-        if src:
-            targets_neg[1] += self.offset_trg
+        if p_cross is None:
+            targets_neg = [
+                torch.multinomial(p_mono, n_neg, replacement=True).view((B, -1)),
+                torch.multinomial(p_mono, n_neg, replacement=True).view((B, -1))]
         else:
-            targets_neg[0] += self.offset_trg
+            targets_neg = [
+                torch.multinomial(p_mono, n_neg, replacement=True).view((B, -1)),
+                torch.multinomial(p_cross, n_neg, replacement=True).view((B, -1))]
+            targets_neg[(1 if src else 0)] += self.offset_trg  # target-side
+
+        # Negative samples
         targets_neg = Variable(torch.cat(targets_neg, dim=1))
         if use_cuda:
             targets_neg = targets_neg.cuda()
@@ -273,11 +280,18 @@ def main(args):
     batch_size = args.batch_size
 
     # Load data
-    lang_src, path_src = args.path_src.split(':')
-    lang_trg, path_trg = args.path_trg.split(':')
     corpus = Corpus(window_size=window_size, verbose=verbose)
+    lang_src, path_src = args.path_src.split(':')
     sents_src = list(corpus.read(path_src, lang=lang_src))
-    sents_trg = list(corpus.read(path_trg, lang=lang_trg))
+    if verbose:
+        logger.info('Read {} sentences'.format(len(sents_src)))
+    try:
+        lang_trg, path_trg = args.path_trg.split(':')
+        sents_trg = list(corpus.read(path_trg, lang=lang_trg))
+        if verbose:
+            logger.info('Read {} sentences'.format(len(sents_src)))
+    except:
+        lang_trg, path_trg = None, None
     corpus.set_i2w()
 
     model = CBOW(corpus.get_vocabsize(), verbose=verbose)
@@ -300,8 +314,10 @@ def main(args):
         # Shuffle sentences and create batches
         np.random.shuffle(sents_src)
         batches_src = generate_batch(sents_src, window_size, batch_size)
-        np.random.shuffle(sents_trg)
-        batches_trg = generate_batch(sents_trg, window_size, batch_size)
+        batches_trg = [None]
+        if args.path_trg:
+            np.random.shuffle(sents_trg)
+            batches_trg = generate_batch(sents_trg, window_size, batch_size)
 
         for batch_src, batch_trg in tqdm(zip_longest(batches_src, batches_trg)):
             for batch, src in [(batch_src, True), (batch_trg, False)]:
@@ -309,17 +325,24 @@ def main(args):
                     continue
                 model.zero_grad()
                 contexts, targets = batch
+
+                # Word embeddings
                 loss_we = loss_func(model, contexts, targets, src=src)
-                loss_d = loss_func_dist(model, contexts, src=src)
-                if loss_d is None:  # distribution loss
-                    loss = loss_we
-                else:
-                    loss = loss_we + loss_d
-                    train_loss_d += float(loss_d.data / batch_size)
+                val = loss_we.data.cpu() if use_cuda else loss_we.data
+                train_loss_we += float(val.numpy()) / batch_size
+                loss = loss_we
+
+                loss_d = None
+                if args.path_trg:
+                    loss_d = loss_func_dist(model, contexts, src=src)
+                if loss_d is not None:  # distribution loss
+                    loss += loss_d
+                    val = loss_d.data.cpu() if use_cuda else loss_d.data
+                    train_loss_d += float(val.numpy()) / batch_size
+
                 loss /= batch_size
                 loss.backward()
                 optimizer.step()
-                train_loss_we += float(loss_we.data / batch_size)
         print('[{}] loss = {:.4f} ({:.4f}/{:.4f}), time = {:.2f}'.format(
             ITER+1, train_loss_we + train_loss_d , train_loss_we, train_loss_d,
             time.time() - start))
@@ -339,7 +362,7 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--src', dest='path_src',
                         required=True, help='path to a source corpus file')
     parser.add_argument('-t', '--trg', dest='path_trg',
-                        required=True, help='path to a target corpus file')
+                        help='path to a target corpus file')
     parser.add_argument('--window-size', type=int, default=2,
                         help='window size on each side')
     parser.add_argument('--lr', type=float, default=0.01,
