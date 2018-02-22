@@ -24,6 +24,7 @@ logger = None
 use_cuda = False
 
 DIM_EMB = 50
+SAMPLE_SIZE = 10
 
 
 class CBOW(nn.Module):
@@ -44,7 +45,7 @@ class CBOW(nn.Module):
 
     def forward_neg(self, X, y):
         """Forward calculation for nagative samples."""
-        context = self.embeddings_x(X).mean(dim=1).squeeze(1)  # (batch_size, dim_embed)
+        context = self.embeddings_x(X).mean(dim=1)  # (batch_size, dim_embed)
         context = context.unsqueeze(dim=2)  # (batch_size, dim_embed, 1)
         target = self.embeddings_y(y)  # (batch_size, neg_sample_size, dim_emb)
         # Output: (batch_size, neg_sample_size)
@@ -168,10 +169,10 @@ class NegativeSamplingLoss():
         B = contexts.size(0)  # batch size
 
         # Positive samples
-        loss = model.forward(contexts, targets).sigmoid().log().sum()
+        loss = F.logsigmoid(model.forward(contexts, targets)).sum()
 
         # Negative samples
-        n_neg = B * self.sample_size
+        n_neg = B * self.sample_size // 2
         if p_cross is None:
             targets_neg = [
                 torch.multinomial(p_mono, n_neg, replacement=True).view((B, -1)),
@@ -186,11 +187,11 @@ class NegativeSamplingLoss():
         targets_neg = Variable(torch.cat(targets_neg, dim=1))
         if use_cuda:
             targets_neg = targets_neg.cuda()
-        loss += model.forward_neg(contexts, targets_neg).neg().sigmoid().log().sum()
+        loss += F.logsigmoid(model.forward_neg(contexts, targets_neg).neg()).sum()
 
         # TODO: trick on cross-lingual negative sampling
 
-        return -loss
+        return loss.neg()
 
 
 class DistributionLoss():
@@ -248,6 +249,7 @@ def save_embeddings(filename, embs, i2w):
         logger.info('Save embeddings to ' + filename)
     with open(filename, 'w') as f:
         f.write('{} {}\n'.format(*embs.shape))
+        assert len(i2w) == len(embs)
         for w, emb in zip(i2w, embs):
             f.write('{} {}\n'.format(w, ' '.join(str(v) for v in emb)))
 
@@ -294,15 +296,18 @@ def main(args):
         lang_trg, path_trg = None, None
     corpus.set_i2w()
 
-    model = CBOW(corpus.get_vocabsize(), verbose=verbose)
+    model = CBOW(corpus.get_vocabsize(), dim_emb=args.dim_emb,
+                 verbose=verbose)
     if use_cuda:
         model.cuda()
     loss_func = NegativeSamplingLoss(corpus.freq, corpus.vocab_range,
-                                     src=lang_src, trg=lang_trg)
-    loss_func_dist = DistributionLoss(DIM_EMB)
+                                     src=lang_src, trg=lang_trg,
+                                     sample_size=SAMPLE_SIZE)
+    loss_func_dist = DistributionLoss(args.dim_emb)
     optimizer = optim.SGD(model.parameters(), lr=lr)
 
     if verbose:
+        logger.info('dimension: {}'.format(args.dim_emb))
         logger.info('window size: {}'.format(window_size))
         logger.info('learning rate: {}'.format(lr))
         logger.info('batch size: {}'.format(batch_size))
@@ -329,7 +334,7 @@ def main(args):
                 # Word embeddings
                 loss_we = loss_func(model, contexts, targets, src=src)
                 val = loss_we.data.cpu() if use_cuda else loss_we.data
-                train_loss_we += float(val.numpy()) / batch_size
+                train_loss_we += float(val.numpy())
                 loss = loss_we
 
                 loss_d = None
@@ -338,9 +343,8 @@ def main(args):
                 if loss_d is not None:  # distribution loss
                     loss += loss_d
                     val = loss_d.data.cpu() if use_cuda else loss_d.data
-                    train_loss_d += float(val.numpy()) / batch_size
+                    train_loss_d += float(val.numpy())
 
-                loss /= batch_size
                 loss.backward()
                 optimizer.step()
         print('[{}] loss = {:.4f} ({:.4f}/{:.4f}), time = {:.2f}'.format(
@@ -363,6 +367,8 @@ if __name__ == '__main__':
                         required=True, help='path to a source corpus file')
     parser.add_argument('-t', '--trg', dest='path_trg',
                         help='path to a target corpus file')
+    parser.add_argument('--dim', dest='dim_emb', type=int, default=DIM_EMB,
+                        help='dimensionality of embedding')
     parser.add_argument('--window-size', type=int, default=2,
                         help='window size on each side')
     parser.add_argument('--lr', type=float, default=0.01,
