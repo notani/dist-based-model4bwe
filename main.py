@@ -361,7 +361,8 @@ def main(args):
             np.random.shuffle(sents_trg)
             batches_trg = generate_batch(sents_trg, window_size, batch_size)
 
-        for batch_src, batch_trg in tqdm(zip_longest(batches_src, batches_trg)):
+        for b, (batch_src, batch_trg) in tqdm(enumerate(
+                zip_longest(batches_src, batches_trg), start=1)):
             for batch, src in [(batch_src, True), (batch_trg, False)]:
                 if batch is None:  # no instances in the batch
                     continue
@@ -385,6 +386,9 @@ def main(args):
                 loss /= batch_size
                 loss.backward()
                 optimizer.step()
+            if b % 10000 == 0:  # Save temporary embeddings
+                embs = model.get_embeddings()
+                save_embeddings(args.path_output + '.tmp', embs, corpus.i2w)
         print('[{}] loss = {:.4f} ({:.4f}/{:.4f}), time = {:.2f}'.format(
             ITER+1, train_loss_we + train_loss_d , train_loss_we, train_loss_d,
             time.time() - start))
